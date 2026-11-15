@@ -1,0 +1,265 @@
+{% extends "base.html" %}
+{% block title %}墓碑压缩 · {{ app_short }}{% endblock %}
+{% block crumb %}墓碑压缩{% endblock %}
+{% block meta %}<span class="dot ok"></span>共同保留边界 = min(各来源安全水位线) · 整批校验通过才切换现网{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/workbench">回工作台</a>
+<a class="btn secondary small" href="/review">复核与导出</a>
+{% endblock %}
+{% block status_left %}来源登记 → 共同边界 → 逐表计划 → 整批影子校验 → 原子切换；成功前旧版完整保留{% endblock %}
+{% block status_right %}{{ app_short }} · 模块 7 墓碑压缩{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">墓碑压缩（模块 7）</h1>
+    <p class="page-sub">
+      已撤销订单的墓碑长期占用快照/导出存储；但清理后可能被补传的低版本记录写回。
+      本页按<strong>各来源共同确认的保留边界</strong>压缩墓碑：共同边界 = min(各来源安全水位线)，
+      墓碑 ts ≤ 边界且全部来源放行才压缩。压缩<strong>整批表校验完成后才替换现网</strong>，
+      中断可从已完成表续跑，成功前保留旧版；同批重跑不重复计数、不误删仍须保留的墓碑。
+    </p>
+  </div>
+</div>
+
+<div class="kpi-strip">
+  <div class="kpi">
+    <div class="k-label">已登记来源</div>
+    <div class="k-value">{{ boundary.source_count }}</div>
+    <div class="k-note">共同边界取最慢来源</div>
+  </div>
+  <div class="kpi">
+    <div class="k-value" style="font-size:13px;font-family:var(--font-mono);letter-spacing:0">{{ boundary.boundary or '未建立' }}</div>
+    <div class="k-label">共同保留边界（UTC）</div>
+    <div class="k-note">{% if boundary.boundary_source %}持有来源 {{ boundary.boundary_source }}{% else %}登记来源后生成{% endif %}</div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">压缩作业</div>
+    <div class="k-value">{{ jobs|length }}</div>
+    <div class="k-note">含历史 / 续跑记录</div>
+  </div>
+  <div class="kpi">
+    <div class="k-label">已压缩归档墓碑</div>
+    <div class="k-value">{{ archived|length }}</div>
+    <div class="k-note">留底可查，不再进快照</div>
+  </div>
+  <div class="kpi {% if blocked %}err{% endif %}">
+    <div class="k-label">拦截的补传重放</div>
+    <div class="k-value">{{ blocked|length }}</div>
+    <div class="k-note">低版本不复活</div>
+  </div>
+</div>
+
+<div class="split">
+  <section class="panel pane-sticky">
+    <div class="panel-head">
+      <h2>1. 来源保留边界</h2>
+      <div class="panel-actions"><span class="tag">min(各来源水位线)</span></div>
+    </div>
+    <div class="panel-body tight">
+      <form id="source-form">
+        <div class="field">
+          <label>来源名称</label>
+          <input name="source" placeholder="如 binlog / mq / backfill" required>
+        </div>
+        <div class="field">
+          <label>安全水位线（ISO，UTC）</label>
+          <input name="watermark" placeholder="2026-11-10T00:42:00Z" required>
+        </div>
+        <div class="field">
+          <label>备注（可选）</label>
+          <input name="note" placeholder="该来源不会再补传 ts ≤ 水位线的事件">
+        </div>
+        <div class="alert alert-error" id="source-error" role="alert" hidden></div>
+        <button type="submit" class="btn small">登记 / 推进来源水位线</button>
+      </form>
+      <p class="small muted" style="margin:10px 0 0">
+        水位线只许前进不许回退；时间不可解析或回退会被显式拒绝。至少 1 个来源才能发起压缩。
+      </p>
+    </div>
+
+    <div class="panel-head" style="border-top:1px solid var(--line)">
+      <h2>2. 发起压缩</h2>
+      <div class="panel-actions"><span class="tag">整批原子</span></div>
+    </div>
+    <div class="panel-body tight">
+      <form id="compaction-form">
+        <div class="field">
+          <label>选择表（不勾 = 全部表）</label>
+          <div class="check-list">
+            {% for item in tables_meta %}
+            <label class="check-item">
+              <input type="checkbox" name="tables" value="{{ item.name }}">
+              <span><strong>{{ item.label }}</strong>
+                <span class="muted small">· 当前墓碑见右侧对照表</span></span>
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+        <div class="alert alert-error" id="compaction-error" role="alert" hidden></div>
+        <button type="submit" class="btn">按共同边界压缩墓碑</button>
+        <span class="small muted" style="margin-left:8px">全部表校验通过才切换现网</span>
+      </form>
+    </div>
+  </section>
+
+  <div>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>各来源保留边界</h2>
+        <div class="panel-actions"><span class="tag">{{ boundary.rule }}</span></div>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>来源</th><th>安全水位线（UTC）</th><th>备注</th></tr></thead>
+          <tbody>
+            {% for item in boundary.sources %}
+            <tr>
+              <td class="mono"><strong>{{ item.source }}</strong>
+                {% if item.source == boundary.boundary_source %}<span class="tag warn">持有共同边界</span>{% endif %}
+              </td>
+              <td class="small mono nowrap">{{ item.watermark }}</td>
+              <td class="small muted">{{ item.note or '—' }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="muted">尚未登记任何来源；没有共同边界时不允许压缩任何墓碑。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>清理前后对照（当前现网口径）</h2>
+        <div class="panel-actions"><span class="tag">压缩只动墓碑，不碰存活行</span></div>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead>
+            <tr><th>表</th><th class="num">归档事件</th><th class="num">键数</th>
+              <th class="num">已压缩归档</th><th class="num">累计拦截重放</th><th>事件时间区间</th></tr>
+          </thead>
+          <tbody>
+            {% for name, item in overview.items() %}
+            <tr>
+              <td><strong>{{ item.label }}</strong><div class="small muted mono">{{ name }}</div></td>
+              <td class="num">{{ item.events }}</td>
+              <td class="num">{{ item['keys'] }}</td>
+              <td class="num" id="archived-{{ name }}">—</td>
+              <td class="num" id="blocked-{{ name }}">—</td>
+              <td class="small muted nowrap">{{ item.first_ts }} → {{ item.last_ts }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">分表的「当前墓碑 / 已归档 / 拦截」明细在每次作业的
+          <a href="#jobs">作业结果</a>里，含清理前后逐表计数与逐墓碑来源投票。</p>
+      </div>
+    </section>
+
+    <section class="panel" id="jobs">
+      <div class="panel-head">
+        <h2>压缩作业历史</h2>
+        <div class="panel-actions"><span class="tag">断点续跑 · 旧版保留到成功</span></div>
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead>
+            <tr><th>作业</th><th>状态</th><th>创建时间</th><th>表</th><th>共同边界</th>
+              <th class="num">压缩前</th><th class="num">本次压缩</th><th class="num">压缩后</th>
+              <th class="num">已完成表</th><th>操作</th></tr>
+          </thead>
+          <tbody id="jobs-tbody">
+            {% for job in jobs %}
+            <tr>
+              <td class="nowrap"><a class="mono" href="/compaction/{{ job.job_id }}">{{ job.job_id }}</a></td>
+              <td><span class="tag {{ 'err' if job.status == 'failed' else ('warn' if job.status == 'running' else 'ok') }}">{{ job_status_labels.get(job.status, job.status) }}</span>
+                {% if job.error %}<div class="small muted">{{ job.error }}</div>{% endif %}
+              </td>
+              <td class="small muted nowrap">{{ job.created_at }}</td>
+              <td class="small">{{ job.tables|join(', ') }}</td>
+              <td class="small mono nowrap">{{ job.boundary.boundary or '—' }}</td>
+              <td class="num">{{ job.summary.totals.tombstone_before if job.summary else '—' }}</td>
+              <td class="num">{{ job.summary.totals.compacted_this_job if job.summary else '—' }}</td>
+              <td class="num">{{ job.summary.totals.tombstone_after if job.summary else '—' }}</td>
+              <td class="num">{{ job.completed|length }}/{{ job.tables|length }}</td>
+              <td class="small nowrap">
+                <a href="/compaction/{{ job.job_id }}">结果页</a>
+                {% if job.status == 'running' %}· <a href="#" class="resume-link" data-job="{{ job.job_id }}">续跑</a>{% endif %}
+              </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="10" class="muted">还没有压缩作业。先登记来源水位线，再发起压缩。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>已压缩墓碑归档（留底 · 不进快照/导出）</h2>
+        <div class="panel-actions"><span class="tag">{{ archived|length }} 条</span></div>
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead><tr><th>作业</th><th>表</th><th>键</th><th class="num">墓碑版本</th><th>归档行号</th>
+            <th>墓碑 ts</th><th>压缩时边界</th><th>压缩时间</th></tr></thead>
+          <tbody>
+            {% for row in archived %}
+            <tr>
+              <td class="small mono nowrap">{{ row.job_id }}</td>
+              <td class="small nowrap">{{ row.table }}</td>
+              <td class="mono">{{ row.pk }}</td>
+              <td class="num">v{{ row.tombstone_version }}</td>
+              <td class="mono small nowrap">第 {{ row.tombstone_line_no }} 行</td>
+              <td class="small mono nowrap">{{ row.tombstone_ts }}</td>
+              <td class="small mono nowrap">{{ row.boundary_ts }}</td>
+              <td class="small muted nowrap">{{ row.compacted_at }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" class="muted">暂无已压缩墓碑。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>拦截记录（压缩边界内的重放，留档且不复活）</h2>
+        <div class="panel-actions"><span class="tag {{ 'err' if blocked else '' }}">{{ blocked|length }} 条</span></div>
+      </div>
+      <div class="table-wrap roomy">
+        <table class="dense">
+          <thead><tr><th>来源/行号</th><th>表</th><th>键</th><th class="num">补传版本</th>
+            <th class="num">墓碑版本</th><th>op</th><th>事件 ts</th><th>拦截依据</th></tr></thead>
+          <tbody>
+            {% for row in blocked %}
+            <tr class="row-conflict">
+              <td class="mono small nowrap">{{ row.source }} 第 {{ row.line_no }} 行</td>
+              <td class="small nowrap">{{ row.table }}</td>
+              <td class="mono">{{ row.pk }}</td>
+              <td class="num">v{{ row.event_version }}</td>
+              <td class="num">v{{ row.tombstone_version }}</td>
+              <td class="small">{{ op_labels.get(row.op, row.op) }}</td>
+              <td class="small mono nowrap">{{ row.event_ts }}</td>
+              <td class="small muted">{{ row.reason }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" class="muted">暂无拦截记录；压缩后若有低版本补传，会在此留档且不会复活。</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/compaction.js"></script>
+{% endblock %}

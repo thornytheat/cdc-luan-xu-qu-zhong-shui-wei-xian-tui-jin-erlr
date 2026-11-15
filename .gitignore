@@ -29,3 +29,8 @@ target/
 *.o
 *.obj
 .DS_Store
+
+# 本地依赖目录（get-pip --target 安装，不进仓库）
+.pydeps/
+.venv/
+data/

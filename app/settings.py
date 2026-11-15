@@ -48,6 +48,15 @@ KIND_LABELS = {
     "superseded": "低版本丢弃",
     "ignored_after_tombstone": "墓碑后忽略",
     "resurrected": "墓碑后复活",
+    "blocked_replay": "压缩后重放拦截",
+}
+
+# 模块 7：来源投票 / 作业状态文案
+VOTE_LABELS = {"release": "同意压缩", "retain": "要求保留"}
+JOB_STATUS_LABELS = {
+    "running": "进行中（可续跑）",
+    "completed": "已完成",
+    "failed": "失败（旧版保留）",
 }
 
 VERDICT_LABELS = {

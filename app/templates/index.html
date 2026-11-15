@@ -59,6 +59,26 @@
       {% if recent %}<a class="btn secondary small" href="/result/{{ recent[0].run_id }}">看最近一次结果</a>{% endif %}
       <a class="btn secondary small" href="/review">复核与导出</a>
       <a class="btn secondary small" href="/workbench#m4">看水位线口径</a>
+      <a class="btn secondary small" href="/compaction">墓碑压缩（模块 7）</a>
+    </p>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>模块 7 · 墓碑压缩</h2>
+    <div class="panel-actions"><span class="tag">保留边界 · 整批原子 · 重放不复活</span></div>
+  </div>
+  <div class="panel-body tight">
+    <p class="small" style="margin:0 0 8px">
+      已撤销订单的墓碑长期留在快照/导出里会撑大存储；但清理后补传的低版本记录可能把删除态写回。
+      模块 7 按<strong>各来源共同确认的保留边界</strong>（<code>min(各来源安全水位线)</code>）压缩墓碑：
+      整批表影子校验全部通过才原子切换现网，中断可从已完成表续跑、成功前保留旧版；
+      压缩墓碑留档不进快照，边界内的补传重放被拦截留档且<strong>绝不复活</strong>。
+    </p>
+    <p class="small" style="margin:0">
+      <a class="btn small" href="/compaction">进入墓碑压缩工作台</a>
+      <a class="btn secondary small" href="/compaction">登记来源水位线 / 查看归档与拦截</a>
     </p>
   </div>
 </section>

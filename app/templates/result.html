@@ -47,9 +47,9 @@
     <div class="k-note">含 {{ summary.ignored_after_tombstone }} 条墓碑后忽略</div>
   </div>
   <div class="kpi">
-    <div class="k-label">删除墓碑</div>
+    <div class="k-label">删除墓碑（当前）</div>
     <div class="k-value">{{ summary.tombstones }}</div>
-    <div class="k-note">墓碑保留，不清理</div>
+    <div class="k-note">已压缩归档的不计入；<a href="/compaction">模块 7</a></div>
   </div>
   <div class="kpi">
     <div class="k-label">全局水位线（UTC）</div>
@@ -121,7 +121,7 @@
     </div>
 
     <div class="panel-body tight" style="border-top:1px solid var(--line)">
-      <h3 style="margin:0 0 8px">删除墓碑（{{ result.tables.values()|map(attribute='tombstone_count')|sum }} 个 · 必须保留）</h3>
+      <h3 style="margin:0 0 8px">当前删除墓碑（{{ result.tables.values()|map(attribute='tombstone_count')|sum }} 个 · 仍须保留）</h3>
     </div>
     <div class="table-wrap">
       <table class="dense">
@@ -152,6 +152,19 @@
       <p class="small muted" style="margin:0">墓碑后到达的低版本 c/u 一律忽略并计入 <code>ignored_after_tombstone</code>；
         只有严格更高版本的事件才会让键复活（本次未出现复活）。</p>
     </div>
+
+    {% if snapshot.compaction %}
+    <div class="panel-body tight" style="border-top:1px solid var(--line)">
+      <h3 style="margin:0 0 8px">模块 7 · 墓碑压缩口径</h3>
+      <p class="small" style="margin:0 0 6px">
+        已压缩归档墓碑 <strong>{{ snapshot.compaction.archived_count }}</strong> 个（不进当前墓碑与表导出，仅在快照 compaction 段留底）；
+        压缩后补传、被拦截且不复活的重放 <strong class="{% if snapshot.compaction.blocked_count %}err{% endif %}">{{ snapshot.compaction.blocked_count }}</strong> 条。
+      </p>
+      <p class="small muted" style="margin:0">
+        逐墓碑的来源投票、清理前后对照与拦截依据见 <a href="/compaction">墓碑压缩工作台</a> 与对应作业结果页。
+      </p>
+    </div>
+    {% endif %}
 
     <div class="panel-body tight" style="border-top:1px solid var(--line)">
       <h3 style="margin:0 0 8px">快照预览（每表前 6 行）</h3>

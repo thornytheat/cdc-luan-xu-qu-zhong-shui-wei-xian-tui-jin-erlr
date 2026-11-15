@@ -33,8 +33,12 @@ def column_order(rows: list[dict]) -> list[str]:
     return order
 
 
-def build_snapshot(run: dict) -> dict:
-    """run 为 runner 产出的运行记录（含 result），这里只做结构化与精简。"""
+def build_snapshot(run: dict, conn=None) -> dict:
+    """run 为 runner 产出的运行记录（含 result），这里只做结构化与精简。
+
+    传入 conn 时附带模块 7 的压缩归档与拦截记录：压缩后的墓碑不再出现在
+    「当前墓碑」里（导出体积随之下降），但完整留底在 compaction 段可追溯。
+    """
     result = run["result"]
     tables: dict[str, dict] = {}
     for table, payload in result["tables"].items():
@@ -49,7 +53,7 @@ def build_snapshot(run: dict) -> dict:
             "counters": payload["counters"],
             "watermark": payload["watermark"],
         }
-    return {
+    snapshot_doc = {
         "export": {
             "app": "cdcwater",
             "app_name": "CDC 乱序去重与水位线推进",
@@ -68,6 +72,19 @@ def build_snapshot(run: dict) -> dict:
         "late_events": result["late_events"],
         "conflicts": result["conflicts"],
     }
+    if conn is not None:
+        from . import store
+
+        compacted = store.fetch_compacted_tombstones(conn)
+        blocked = store.fetch_blocked_replays(conn)
+        snapshot_doc["compaction"] = {
+            "note": "已压缩墓碑不进当前墓碑与表导出，仅在此段留底；拦截的低版本重放不复活",
+            "archived_tombstones": compacted,
+            "archived_count": len(compacted),
+            "blocked_replays": blocked,
+            "blocked_count": len(blocked),
+        }
+    return snapshot_doc
 
 
 def dumps(snapshot: dict) -> str:

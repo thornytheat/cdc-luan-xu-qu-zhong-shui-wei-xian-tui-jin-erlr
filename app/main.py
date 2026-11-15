@@ -13,8 +13,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import archive, runner, schema_gate, settings, snapshot, store
+from . import archive, compaction_runner, runner, schema_gate, settings, snapshot, store
 from .archive import EventError
+from .compaction_runner import JobError
+from .retention import RetentionError, SourceWatermark, boundary_views, register_source
+from .archive import parse_ts
 
 BASE_DIR = settings.BASE_DIR
 
@@ -37,6 +40,19 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
 class MergeRequest(BaseModel):
     tables: list[str] = Field(default_factory=list, description="要合并的表名")
     schema_version: int = Field(2, ge=1, le=2, description="要评估的目标 schema 版本")
+
+
+class SourceWatermarkRequest(BaseModel):
+    source: str = Field(..., description="来源名称，如 binlog / mq / backfill")
+    watermark: str = Field(..., description="该来源的安全水位线（ISO 时间）")
+    note: str = Field("", description="备注")
+
+
+class CompactionRequest(BaseModel):
+    tables: list[str] = Field(default_factory=list, description="要压缩墓碑的表名；空=全部表")
+    sources: list[SourceWatermarkRequest] | None = Field(
+        None, description="可选：本次随请求登记的来源水位线"
+    )
 
 
 def render(request: Request, template: str, **ctx) -> HTMLResponse:
@@ -72,6 +88,9 @@ def health():
             "app": settings.APP_SHORT,
             "events": store.total_events(conn),
             "runs": store.run_count(conn),
+            "compaction_jobs": store.count_compaction_jobs(conn),
+            "compacted_tombstones": store.compacted_count(conn),
+            "blocked_replays": store.blocked_replay_count(conn),
             "seed_version": store.get_meta(conn, "seed_version"),
         }
     finally:
@@ -146,19 +165,19 @@ def result_page(request: Request, run_id: str):
     conn = with_conn()
     try:
         run = store.get_run(conn, run_id)
+        if run is None:
+            return render(
+                request,
+                "not_found.html",
+                page="not_found",
+                nav="",
+                run_id=run_id,
+                error=f"没有找到运行 {run_id}，可能已被清理；请到工作台重新执行一次合并。",
+            )
+        snap = snapshot.build_snapshot(run, conn=conn)
+        preview = snapshot.preview(snap)
     finally:
         conn.close()
-    if run is None:
-        return render(
-            request,
-            "not_found.html",
-            page="not_found",
-            nav="",
-            run_id=run_id,
-            error=f"没有找到运行 {run_id}，可能已被清理；请到工作台重新执行一次合并。",
-        )
-    snap = snapshot.build_snapshot(run)
-    preview = snapshot.preview(snap)
     result = run["result"]
     ignored = {
         table: set(payload.get("ignored_line_nos", []))
@@ -324,11 +343,11 @@ def api_snapshot(run_id: str):
     conn = with_conn()
     try:
         run = store.get_run(conn, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"运行不存在：{run_id}")
+        payload = snapshot.dumps(snapshot.build_snapshot(run, conn=conn))
     finally:
         conn.close()
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"运行不存在：{run_id}")
-    payload = snapshot.dumps(snapshot.build_snapshot(run))
     filename = f"cdcwater-snapshot-{run_id}.json"
     return Response(
         content=payload,
@@ -366,3 +385,198 @@ def api_schema(version: int):
     if version not in (1, 2):
         raise HTTPException(status_code=400, detail="schema 版本只支持 1 或 2")
     return schema_gate.load_schema(settings.SCHEMAS_DIR / f"v{version}.json")
+
+
+# --- 模块 7：墓碑压缩 ------------------------------------------------------
+
+
+def _load_registered_sources(conn) -> dict[str, SourceWatermark]:
+    sources: dict[str, SourceWatermark] = {}
+    for row in store.fetch_source_watermarks(conn):
+        sources[row["source"]] = SourceWatermark(
+            source=row["source"], watermark=parse_ts(row["watermark"]), note=row.get("note", "")
+        )
+    return sources
+
+
+def _register_request_sources(conn, items: list[SourceWatermarkRequest] | None) -> None:
+    if not items:
+        return
+    sources = _load_registered_sources(conn)
+    for item in items:
+        entry = register_source(sources, item.source, item.watermark, item.note)
+        store.upsert_source_watermark(conn, entry.source, entry.watermark_iso, entry.note)
+
+
+@app.get("/compaction", response_class=HTMLResponse)
+def compaction_page(request: Request):
+    """墓碑压缩工作台：来源边界、作业历史、归档与拦截记录。"""
+    conn = with_conn()
+    try:
+        sources = _load_registered_sources(conn)
+        jobs = store.list_compaction_jobs(conn, limit=20)
+        archived = store.fetch_compacted_tombstones(conn)
+        blocked = store.fetch_blocked_replays(conn)
+        overview = store.event_overview(conn)
+    finally:
+        conn.close()
+    return render(
+        request,
+        "compaction.html",
+        page="compaction",
+        nav="compaction",
+        boundary=boundary_views(sources),
+        sources_raw=sources,
+        jobs=jobs,
+        archived=archived,
+        blocked=blocked,
+        overview=overview,
+        job_status_labels=settings.JOB_STATUS_LABELS,
+        vote_labels=settings.VOTE_LABELS,
+    )
+
+
+@app.get("/compaction/{job_id}", response_class=HTMLResponse)
+def compaction_result_page(request: Request, job_id: str):
+    conn = with_conn()
+    try:
+        try:
+            detail = compaction_runner.job_detail(conn, job_id)
+        except JobError:
+            return render(
+                request,
+                "not_found.html",
+                page="not_found",
+                nav="compaction",
+                run_id=job_id,
+                error=f"没有找到压缩作业 {job_id}；请到墓碑压缩页重新发起。",
+            )
+    finally:
+        conn.close()
+    return render(
+        request,
+        "compaction_result.html",
+        page="compaction",
+        nav="compaction",
+        job=detail,
+        vote_labels=settings.VOTE_LABELS,
+        job_status_labels=settings.JOB_STATUS_LABELS,
+    )
+
+
+@app.get("/api/retention/sources")
+def api_list_sources():
+    conn = with_conn()
+    try:
+        sources = _load_registered_sources(conn)
+        return boundary_views(sources)
+    finally:
+        conn.close()
+
+
+@app.post("/api/retention/sources")
+def api_register_source(payload: SourceWatermarkRequest):
+    conn = with_conn()
+    try:
+        sources = _load_registered_sources(conn)
+        try:
+            entry = register_source(sources, payload.source, payload.watermark, payload.note)
+        except RetentionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        store.upsert_source_watermark(conn, entry.source, entry.watermark_iso, entry.note)
+        return boundary_views(_load_registered_sources(conn))
+    finally:
+        conn.close()
+
+
+@app.post("/api/compaction/jobs")
+def api_create_compaction(payload: CompactionRequest):
+    conn = with_conn()
+    try:
+        try:
+            _register_request_sources(conn, payload.sources)
+            tables = payload.tables or settings.TABLE_NAMES
+            job = compaction_runner.start_job(conn, tables)
+        except (JobError, RetentionError, runner.RunError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    return JSONResponse(
+        {
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "tables": job["tables"],
+            "completed": job["completed"],
+            "boundary": job["boundary"],
+            "summary": job["summary"],
+            "verification": job["verification"],
+            "result_url": f"/compaction/{job['job_id']}",
+        }
+    )
+
+@app.get("/api/compaction/jobs")
+def api_list_compaction_jobs(limit: int = Query(default=20, ge=1, le=100)):
+    conn = with_conn()
+    try:
+        jobs = store.list_compaction_jobs(conn, limit=limit)
+    finally:
+        conn.close()
+    return {"jobs": jobs, "count": len(jobs)}
+
+
+@app.get("/api/compaction/jobs/{job_id}")
+def api_get_compaction_job(job_id: str):
+    conn = with_conn()
+    try:
+        try:
+            detail = compaction_runner.job_detail(conn, job_id)
+        except JobError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    return detail
+
+
+@app.post("/api/compaction/jobs/{job_id}/resume")
+def api_resume_compaction_job(job_id: str):
+    """中断续跑：从已完成表清单之后继续；completed 作业幂等返回历史结果。"""
+    conn = with_conn()
+    try:
+        if store.get_compaction_job(conn, job_id) is None:
+            raise HTTPException(status_code=404, detail=f"压缩作业不存在：{job_id}")
+        try:
+            job = compaction_runner.run_job(conn, job_id)
+        except (JobError, RetentionError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        conn.close()
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "tables": job["tables"],
+        "completed": job["completed"],
+        "boundary": job["boundary"],
+        "summary": job["summary"],
+        "verification": job["verification"],
+        "result_url": f"/compaction/{job['job_id']}",
+    }
+
+
+@app.get("/api/compaction/archived")
+def api_archived(table: str | None = None):
+    conn = with_conn()
+    try:
+        rows = store.fetch_compacted_tombstones(conn, table)
+        return {"archived": rows, "count": len(rows)}
+    finally:
+        conn.close()
+
+
+@app.get("/api/compaction/blocked-replays")
+def api_blocked_replays(table: str | None = None):
+    conn = with_conn()
+    try:
+        rows = store.fetch_blocked_replays(conn, table)
+        return {"blocked_replays": rows, "count": len(rows)}
+    finally:
+        conn.close()

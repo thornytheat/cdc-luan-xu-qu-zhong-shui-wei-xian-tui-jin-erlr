@@ -1,0 +1,213 @@
+{% extends "base.html" %}
+{% block title %}压缩作业 {{ job.job_id }} · {{ app_short }}{% endblock %}
+{% block crumb %}压缩作业结果{% endblock %}
+{% block meta %}<span class="dot {{ 'err' if job.status == 'failed' else ('warn' if job.status == 'running' else 'ok') }}"></span>{{ job_status_labels.get(job.status, job.status) }}{% endblock %}
+{% block actions %}
+<a class="btn secondary small" href="/compaction">回压缩工作台</a>
+{% if job.status == 'running' %}
+<button type="button" class="btn small" id="resume-btn" data-job="{{ job.job_id }}">从已完成表续跑</button>
+{% endif %}
+{% endblock %}
+{% block status_left %}job {{ job.job_id }} · {{ job.created_at }} → {{ job.updated_at }}{% endblock %}
+{% block status_right %}{{ app_short }} · 模块 7{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">压缩作业 · <span class="mono">{{ job.job_id }}</span></h1>
+    <p class="page-sub">
+      状态 <span class="tag {{ 'err' if job.status == 'failed' else ('warn' if job.status == 'running' else 'ok') }}">{{ job_status_labels.get(job.status, job.status) }}</span>
+      · 表 {{ job.tables|join(' / ') }} · 已完成表 {{ job.completed|length }}/{{ job.tables|length }}
+      {% if job.error %}· <strong class="muted">失败原因：{{ job.error }}（现网未切换，旧版保留）</strong>{% endif %}
+    </p>
+  </div>
+  <div class="page-head-actions">
+    <a class="btn secondary small" href="/compaction">回压缩工作台</a>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>各来源保留边界（共同确认口径）</h2>
+    <div class="panel-actions"><span class="tag">{{ job.boundary.rule }}</span></div>
+  </div>
+  <div class="table-wrap">
+    <table class="dense">
+      <thead><tr><th>来源</th><th>安全水位线（UTC）</th><th>备注</th></tr></thead>
+      <tbody>
+        {% for item in job.boundary.sources %}
+        <tr>
+          <td class="mono"><strong>{{ item.source }}</strong>
+            {% if item.source == job.boundary.boundary_source %}<span class="tag warn">持有共同边界</span>{% endif %}
+          </td>
+          <td class="small mono nowrap">{{ item.watermark }}</td>
+          <td class="small muted">{{ item.note or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="panel-body tight">
+    <p class="small" style="margin:0">
+      共同保留边界 <code class="mono">{{ job.boundary.boundary }}</code>
+      （{{ job.boundary.source_count }} 个来源取 min）；墓碑 ts ≤ 该边界且全部来源投票放行才压缩。
+    </p>
+  </div>
+</section>
+
+{% if job.verification %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>整批影子校验（全部表通过才切换现网）</h2>
+    <div class="panel-actions">
+      <span class="tag {{ 'err' if not job.verification.ok else 'ok' }}">
+        {{ '校验通过：pass_all_tables' if job.verification.ok else '校验未过：abort_keep_previous' }}
+      </span>
+    </div>
+  </div>
+  <div class="table-wrap roomy">
+    <table class="dense">
+      <thead>
+        <tr><th>表</th><th>校验结果</th><th class="num">压缩前墓碑</th><th class="num">本次压缩</th>
+          <th class="num">保留</th><th class="num">压缩后墓碑</th><th class="num">存活行（不变）</th><th>逐条断言</th></tr>
+      </thead>
+      <tbody>
+        {% for table, check in job.verification.per_table.items() %}
+        <tr class="{{ 'row-conflict' if not check.ok else '' }}">
+          <td class="nowrap"><strong>{{ table }}</strong></td>
+          <td><span class="tag {{ 'err' if not check.ok else 'ok' }}">{{ '通过' if check.ok else '失败' }}</span></td>
+          <td class="num">{{ check.tombstone_before }}</td>
+          <td class="num">{{ check.compacting }}</td>
+          <td class="num">{{ check.retained }}</td>
+          <td class="num">{{ check.tombstone_after }}</td>
+          <td class="num">{{ check.alive_rows }}</td>
+          <td class="small muted">
+            {% for c in check.checks %}
+            <div><span class="tag {{ 'err' if not c.ok else 'ok' }}">{{ '✓' if c.ok else '✗' }}</span> {{ c.name }}：{{ c.detail }}</div>
+            {% endfor %}
+            {% for f in check.failures %}<div class="small" style="color:var(--danger,#c0392b)">{{ f }}</div>{% endfor %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+{% if job.summary %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>清理前后对照（逐表）</h2>
+    <div class="panel-actions"><span class="tag">存活行不参与压缩</span></div>
+  </div>
+  <div class="table-wrap">
+    <table class="dense">
+      <thead>
+        <tr><th>表</th><th class="num">压缩前墓碑</th><th class="num">本次压缩归档</th>
+          <th class="num">仍须保留</th><th class="num">压缩后当前墓碑</th>
+          <th class="num">归档累计</th><th class="num">存活行</th><th class="num">累计拦截重放</th></tr>
+      </thead>
+      <tbody>
+        {% for table, row in job.summary.tables.items() %}
+        <tr>
+          <td class="nowrap"><strong>{{ table }}</strong></td>
+          <td class="num">{{ row.tombstone_before }}</td>
+          <td class="num">{{ row.compacted_this_job }}</td>
+          <td class="num">{{ row.retained }}</td>
+          <td class="num"><strong>{{ row.tombstone_after }}</strong></td>
+          <td class="num">{{ row.archived_total }}</td>
+          <td class="num">{{ row.alive_rows }}</td>
+          <td class="num {% if row.blocked_replays %}err{% endif %}">{{ row.blocked_replays }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr>
+          <th>合计</th>
+          <th class="num">{{ job.summary.totals.tombstone_before }}</th>
+          <th class="num">{{ job.summary.totals.compacted_this_job }}</th>
+          <th class="num">—</th>
+          <th class="num">{{ job.summary.totals.tombstone_after }}</th>
+          <th class="num">{{ job.summary.totals.archived_total }}</th>
+          <th class="num">—</th>
+          <th class="num">{{ job.summary.totals.blocked_replays }}</th>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+{% if job.plan %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>逐墓碑判定与各来源投票</h2>
+    <div class="panel-actions"><span class="tag">压缩边界内才放行</span></div>
+  </div>
+  <div class="table-wrap roomy">
+    <table class="dense">
+      <thead>
+        <tr><th>表</th><th>键</th><th class="num">墓碑版本</th><th>墓碑行号</th><th>墓碑 ts</th>
+          <th>判定</th><th>逐来源投票</th><th>依据</th></tr>
+      </thead>
+      <tbody>
+        {% for table, plan in job.plan.items() %}
+          {% for d in plan.decisions %}
+          <tr class="{{ '' if d.eligible else 'row-keep' }}">
+            <td class="small nowrap">{{ table }}</td>
+            <td class="mono">{{ d.pk }}</td>
+            <td class="num">v{{ d.tombstone_version }}</td>
+            <td class="mono small nowrap">第 {{ d.tombstone_line_no }} 行</td>
+            <td class="small mono nowrap">{{ d.tombstone_ts }}</td>
+            <td><span class="tag {{ 'ok' if d.eligible else 'warn' }}">{{ '压缩归档' if d.eligible else '保留' }}</span></td>
+            <td class="small">
+              {% for v in d.votes %}
+              <div><code>{{ v.source }}</code>
+                <span class="tag {{ 'ok' if v.vote == 'release' else 'warn' }}">{{ vote_labels.get(v.vote, v.vote) }}</span>
+                <span class="muted">{{ v.watermark }}</span></div>
+              {% else %}<span class="muted">无来源登记（保守保留）</span>{% endfor %}
+            </td>
+            <td class="small muted">{{ d.reason }}</td>
+          </tr>
+          {% endfor %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>拦截记录（边界内重放 · 留档不复活）</h2>
+    <div class="panel-actions"><span class="tag {{ 'err' if job.blocked_replays else '' }}">{{ job.blocked_replays|length }} 条</span></div>
+  </div>
+  <div class="table-wrap roomy">
+    <table class="dense">
+      <thead><tr><th>来源/行号</th><th>表</th><th>键</th><th class="num">补传版本</th>
+        <th class="num">墓碑版本</th><th>op</th><th>事件 ts</th><th>拦截依据</th></tr></thead>
+      <tbody>
+        {% for row in job.blocked_replays %}
+        <tr class="row-conflict">
+          <td class="mono small nowrap">{{ row.source }} 第 {{ row.line_no }} 行</td>
+          <td class="small nowrap">{{ row.table }}</td>
+          <td class="mono">{{ row.pk }}</td>
+          <td class="num">v{{ row.event_version }}</td>
+          <td class="num">v{{ row.tombstone_version }}</td>
+          <td class="small">{{ op_labels.get(row.op, row.op) }}</td>
+          <td class="small mono nowrap">{{ row.event_ts }}</td>
+          <td class="small muted">{{ row.reason }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="muted">本作业暂无拦截记录。</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/compaction.js"></script>
+{% endblock %}
